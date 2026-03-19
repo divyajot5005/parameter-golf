@@ -24,6 +24,7 @@ import sentencepiece as spm
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from tqdm.auto import tqdm
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -62,6 +63,7 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     use_compile = bool(int(os.environ.get("USE_COMPILE", "1")))
     sdp_backend = os.environ.get("SDP_BACKEND", "flash")
+    use_tqdm = bool(int(os.environ.get("USE_TQDM", "1")))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -859,6 +861,7 @@ def main() -> None:
         raise ValueError(f"Unsupported SDP_BACKEND={args.sdp_backend!r}")
 
     logfile = None
+    progress_bar = None
     if master_process:
         os.makedirs("logs", exist_ok=True)
         logfile = f"logs/{args.run_id}.txt"
@@ -868,7 +871,10 @@ def main() -> None:
         if not master_process:
             return
         if console:
-            print(msg)
+            if progress_bar is not None:
+                progress_bar.write(msg)
+            else:
+                print(msg)
         if logfile is not None:
             with open(logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
@@ -1012,6 +1018,9 @@ def main() -> None:
     )
     log0(f"seed:{args.seed}")
 
+    if master_process and args.use_tqdm and sys.stderr.isatty():
+        progress_bar = tqdm(total=args.iterations, desc="train", dynamic_ncols=True, mininterval=0.5)
+
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
@@ -1041,6 +1050,8 @@ def main() -> None:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
+        if progress_bar is not None:
+            progress_bar.set_description("warmup")
         for warmup_step in range(args.warmup_steps):
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
@@ -1062,6 +1073,8 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        if progress_bar is not None:
+            progress_bar.set_description("train")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1078,6 +1091,8 @@ def main() -> None:
 
         should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
         if should_validate:
+            if progress_bar is not None:
+                progress_bar.set_description("validate")
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
             val_loss, val_bpb = eval_val(
@@ -1096,6 +1111,8 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            if progress_bar is not None and not last_step:
+                progress_bar.set_description("train")
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1137,6 +1154,9 @@ def main() -> None:
         zero_grad_all()
 
         step += 1
+        if progress_bar is not None:
+            progress_bar.update(1)
+            progress_bar.set_postfix(train_loss=f"{train_loss.item():.4f}", refresh=False)
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
             args.train_log_every > 0
@@ -1161,6 +1181,8 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if progress_bar is not None:
+        progress_bar.set_description("finalize")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
@@ -1225,6 +1247,8 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    if progress_bar is not None:
+        progress_bar.close()
 
     if distributed:
         dist.destroy_process_group()
